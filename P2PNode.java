@@ -23,6 +23,9 @@ import org.java_websocket.server.WebSocketServer;
 import java.io.*;
 import java.net.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.*;
 import java.util.concurrent.*;
 import org.json.JSONObject;
@@ -38,6 +41,7 @@ public class P2PNode {
     private boolean p2pServicesStarted = false;
 
     private final Set<String> localFiles = new ConcurrentHashMap<>().newKeySet();
+    private final Map<String, byte[]> fileStorage = new ConcurrentHashMap<>(); // Menyimpan konten file
     private final Map<String, String> discoveredPeers = new ConcurrentHashMap<>(); // peerId -> host:p2pPort
     private final MyWebSocketServer wsServer;
 
@@ -91,7 +95,6 @@ public class P2PNode {
         }
     }
     
-    // Handler untuk halaman login
     static class RootHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
@@ -100,7 +103,6 @@ public class P2PNode {
         }
     }
 
-    // Handler untuk memproses login
     static class LoginHandler implements HttpHandler {
         private P2PNode node;
         public LoginHandler(P2PNode node) { this.node = node; }
@@ -112,21 +114,15 @@ public class P2PNode {
                 String query = br.readLine();
                 Map<String, String> params = parseQuery(query);
                 String username = params.getOrDefault("username", "User" + (new Random().nextInt(1000)));
-                
-                // URL Decode the username
                 username = URLDecoder.decode(username, "UTF-8");
-
                 node.userName = username;
                 node.startP2PServices();
-
-                // Redirect ke halaman aplikasi utama
                 t.getResponseHeaders().set("Location", "/app");
                 t.sendResponseHeaders(302, -1);
             }
         }
     }
 
-    // Handler untuk halaman aplikasi utama
     static class AppHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
@@ -135,7 +131,7 @@ public class P2PNode {
         }
     }
 
-    // Handler untuk upload file
+    // === UPLOAD HANDLER YANG TELAH DIPERBAIKI SECARA MENYELURUH ===
     static class UploadHandler implements HttpHandler {
         private P2PNode node;
         public UploadHandler(P2PNode node) { this.node = node; }
@@ -146,33 +142,42 @@ public class P2PNode {
                 return;
             }
             String filename = null;
+            byte[] fileContent = null;
             try {
+                String contentType = t.getRequestHeaders().getFirst("Content-Type");
+                String boundary = "--" + contentType.substring(contentType.indexOf("boundary=") + 9);
+                byte[] boundaryBytes = boundary.getBytes(StandardCharsets.UTF_8);
+
                 InputStream is = t.getRequestBody();
                 ByteArrayOutputStream baos = new ByteArrayOutputStream();
-                byte[] buffer = new byte[2048];
-                int length;
-                while ((length = is.read(buffer)) != -1) {
-                    baos.write(buffer, 0, length);
+                byte[] buffer = new byte[4096];
+                int read;
+                while ((read = is.read(buffer)) != -1) {
+                    baos.write(buffer, 0, read);
                 }
-                byte[] requestBodyBytes = baos.toByteArray();
-                String requestBody = new String(requestBodyBytes, StandardCharsets.ISO_8859_1);
+                byte[] bodyBytes = baos.toByteArray();
+
+                int start = indexOf(bodyBytes, "filename=\"".getBytes(StandardCharsets.UTF_8), 0) + 10;
+                int end = indexOf(bodyBytes, "\"".getBytes(StandardCharsets.UTF_8), start);
+                filename = new String(Arrays.copyOfRange(bodyBytes, start, end), StandardCharsets.UTF_8);
+
+                byte[] separator = "\r\n\r\n".getBytes(StandardCharsets.UTF_8);
+                int contentStart = indexOf(bodyBytes, separator, end) + 4;
+                int contentEnd = lastIndexOf(bodyBytes, boundaryBytes, bodyBytes.length) - 2; // -2 for \r\n
                 
-                String searchString = "filename=\"";
-                int startIndex = requestBody.indexOf(searchString);
-                if (startIndex != -1) {
-                    startIndex += searchString.length();
-                    int endIndex = requestBody.indexOf("\"", startIndex);
-                    if (endIndex != -1) {
-                        filename = new String(requestBody.substring(startIndex, endIndex).getBytes(StandardCharsets.ISO_8859_1), StandardCharsets.UTF_8);
-                    }
+                if (contentEnd < contentStart) { // Fallback for last part boundary
+                    contentEnd = lastIndexOf(bodyBytes, (boundary + "--").getBytes(StandardCharsets.UTF_8), bodyBytes.length) -2;
                 }
+
+                fileContent = Arrays.copyOfRange(bodyBytes, contentStart, contentEnd);
+
             } catch (Exception e) {
                 e.printStackTrace();
             }
             String response;
-            if (filename != null && !filename.isEmpty()) {
+            if (filename != null && fileContent != null) {
                 filename = new File(filename).getName();
-                node.addLocalFile(filename);
+                node.addFile(filename, fileContent);
                 node.wsServer.broadcastState();
                 response = "File '" + filename + "' berhasil diunggah.";
                 t.sendResponseHeaders(200, response.length());
@@ -186,22 +191,20 @@ public class P2PNode {
         }
     }
     
-    // Handler untuk download file
+    // === DOWNLOAD HANDLER YANG TELAH DIPERBAIKI ===
     static class DownloadHandler implements HttpHandler {
         private P2PNode node;
         public DownloadHandler(P2PNode node) { this.node = node; }
         @Override
         public void handle(HttpExchange t) throws IOException {
             Map<String, String> params = parseQuery(t.getRequestURI().getQuery());
-            String filename = params.get("file");
+            String filename = URLDecoder.decode(params.get("file"), "UTF-8");
 
-            if (filename != null && node.localFiles.contains(filename)) {
-                // Simulasi konten file
-                String fileContent = "Ini adalah konten simulasi untuk file: " + filename;
-                byte[] contentBytes = fileContent.getBytes(StandardCharsets.UTF_8);
+            byte[] contentBytes = node.getFileContent(filename);
 
+            if (contentBytes != null) {
                 t.getResponseHeaders().set("Content-Disposition", "attachment; filename=\"" + filename + "\"");
-                t.getResponseHeaders().set("Content-Type", "text/plain");
+                t.getResponseHeaders().set("Content-Type", getMimeType(filename));
                 t.sendResponseHeaders(200, contentBytes.length);
                 
                 OutputStream os = t.getResponseBody();
@@ -217,7 +220,6 @@ public class P2PNode {
         }
     }
     
-    // Helper untuk mengirim respons HTML
     private static void sendHtmlResponse(HttpExchange t, String html) throws IOException {
         t.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
         byte[] responseBytes = html.getBytes(StandardCharsets.UTF_8);
@@ -227,7 +229,6 @@ public class P2PNode {
         os.close();
     }
 
-    // Helper untuk parsing parameter query
     private static Map<String, String> parseQuery(String query) {
         Map<String, String> params = new HashMap<>();
         if (query != null) {
@@ -243,9 +244,11 @@ public class P2PNode {
         return params;
     }
 
-    public void addLocalFile(String filename) {
-        this.localFiles.add(filename);
-        System.out.println("File ditambahkan: " + filename);
+    // Menyimpan file dan kontennya
+    public void addFile(String filename, byte[] content) {
+        localFiles.add(filename);
+        fileStorage.put(filename, content);
+        System.out.println("File disimpan: " + filename + " (" + content.length + " bytes)");
     }
     
     public void searchFile(String filename) {
@@ -260,9 +263,17 @@ public class P2PNode {
         wsServer.logToUI("Meminta izin unduh dari " + ownerId + " untuk file '" + filename + "'");
     }
     
+    // === RESPONS IZIN SEKARANG MENGIRIM KONTEN FILE ===
     public void respondToPermission(String requesterId, String filename, boolean grant) {
         String type = grant ? "PERMISSION_GRANTED" : "PERMISSION_DENIED";
-        String message = String.format("%s::%s::%s", type, this.peerId, filename);
+        String message;
+        if (grant) {
+            byte[] fileContent = getFileContent(filename);
+            String base64Content = Base64.getEncoder().encodeToString(fileContent);
+            message = String.format("%s::%s::%s::%s", type, this.peerId, filename, base64Content);
+        } else {
+            message = String.format("%s::%s::%s", type, this.peerId, filename);
+        }
         sendMessageToPeer(requesterId, message);
         wsServer.logToUI("Mengirim respons izin (" + (grant ? "DISETUJUI" : "DITOLAK") + ") ke " + requesterId);
     }
@@ -307,8 +318,48 @@ public class P2PNode {
     public int getP2pPort() { return p2pPort; }
     public Map<String, String> getDiscoveredPeers() { return discoveredPeers; }
     public Set<String> getLocalFiles() { return localFiles; }
+    public byte[] getFileContent(String filename) { return fileStorage.get(filename); }
     public MyWebSocketServer getWsServer() { return wsServer; }
     public boolean hasFile(String filename) { return localFiles.contains(filename); }
+
+    // Helper methods
+    private static String getMimeType(String filename) {
+        try {
+            return Files.probeContentType(Paths.get(filename));
+        } catch (IOException e) {
+            return "application/octet-stream";
+        }
+    }
+    private static int indexOf(byte[] source, byte[] match, int fromIndex) {
+        for (int i = fromIndex; i <= source.length - match.length; i++) {
+            if (source[i] == match[0]) {
+                boolean found = true;
+                for (int j = 1; j < match.length; j++) {
+                    if (source[i + j] != match[j]) {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) return i;
+            }
+        }
+        return -1;
+    }
+    private static int lastIndexOf(byte[] source, byte[] match, int fromIndex) {
+        for (int i = fromIndex - match.length; i >= 0; i--) {
+            if (source[i] == match[0]) {
+                boolean found = true;
+                for (int j = 1; j < match.length; j++) {
+                    if (source[i + j] != match[j]) {
+                        found = false;
+                        break;
+                    }
+                }
+                if (found) return i;
+            }
+        }
+        return -1;
+    }
 
     private static String getLoginPageHtml() {
         return "<!DOCTYPE html>"
@@ -478,7 +529,7 @@ class P2PListener extends Thread {
             String message = in.readLine();
             if (message == null) return;
             
-            String[] parts = message.split("::", 3);
+            String[] parts = message.split("::", 4); // Diubah menjadi 4 untuk menangani konten
             String type = parts[0];
             String senderId = parts[1];
             String payload = parts[2];
@@ -500,16 +551,14 @@ class P2PListener extends Thread {
                 case "PERMISSION_REQUEST":
                     node.getWsServer().permissionRequested(senderId, payload);
                     break;
+                // === PENANGANAN UNDUHAN ANTAR-PEER YANG SEBENARNYA ===
                 case "PERMISSION_GRANTED":
                     node.getWsServer().logToUI("Izin DIBERIKAN oleh " + senderId + " untuk file '" + payload + "'.");
-                    new Thread(() -> {
-                        try {
-                            Thread.sleep(2000);
-                            node.addLocalFile(payload);
-                            node.getWsServer().logToUI("Unduhan '" + payload + "' selesai.");
-                            node.getWsServer().broadcastState();
-                        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
-                    }).start();
+                    String base64Content = parts[3];
+                    byte[] fileContent = Base64.getDecoder().decode(base64Content);
+                    node.addFile(payload, fileContent);
+                    node.getWsServer().logToUI("Unduhan '" + payload + "' dari peer lain selesai.");
+                    node.getWsServer().broadcastState();
                     break;
                 case "PERMISSION_DENIED":
                      node.getWsServer().logToUI("Izin DITOLAK oleh " + senderId + " untuk file '" + payload + "'.");
