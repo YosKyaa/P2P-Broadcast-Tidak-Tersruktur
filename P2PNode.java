@@ -1,14 +1,16 @@
-// Untuk menjalankan kode ini, Anda memerlukan DUA library eksternal:
+// Untuk menjalankan kode ini, Anda memerlukan EMPAT library eksternal.
 // 1. Java-WebSocket: https://github.com/TooTallNate/Java-WebSocket/releases (misal: Java-WebSocket-1.6.0.jar)
-// 2. JSON-Java: https://search.maven.org/artifact/org.json/json (misal: json-20230227.jar)
+// 2. JSON-Java: https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar
+// 3. SLF4J API: https://repo1.maven.org/maven2/org/slf4j/slf4j-api/2.0.13/slf4j-api-2.0.13.jar
+// 4. SLF4J Simple: https://repo1.maven.org/maven2/org/slf4j/slf4j-simple/2.0.13/slf4j-simple-2.0.13.jar
 //
-// Letakkan kedua file .jar di direktori yang sama dengan P2PNode.java
+// Letakkan keempat file .jar di direktori yang sama dengan P2PNode.java
 //
-// Kompilasi (Windows): javac -cp "Java-WebSocket-1.6.0.jar;json-20230227.jar;." P2PNode.java
-// Kompilasi (macOS/Linux): javac -cp "Java-WebSocket-1.6.0.jar:json-20230227.jar:." P2PNode.java
+// Kompilasi (Windows): javac -cp "Java-WebSocket-1.6.0.jar;json-20240303.jar;slf4j-api-2.0.13.jar;slf4j-simple-2.0.13.jar;." P2PNode.java
+// Kompilasi (macOS/Linux): javac -cp "Java-WebSocket-1.6.0.jar:json-20240303.jar:slf4j-api-2.0.13.jar:slf4j-simple-2.0.13.jar:." P2PNode.java
 //
-// Jalankan (Windows): java -cp "Java-WebSocket-1.6.0.jar;json-20230227.jar;." P2PNode <port>
-// Jalankan (macOS/Linux): java -cp "Java-WebSocket-1.6.0.jar:json-20230227.jar:." P2PNode <port>
+// Jalankan (Windows): java -cp "Java-WebSocket-1.6.0.jar;json-20240303.jar;slf4j-api-2.0.13.jar;slf4j-simple-2.0.13.jar;." P2PNode <port>
+// Jalankan (macOS/Linux): java -cp "Java-WebSocket-1.6.0.jar:json-20240303.jar:slf4j-api-2.0.13.jar:slf4j-simple-2.0.13.jar:." P2PNode <port>
 
 import com.sun.net.httpserver.HttpServer;
 import com.sun.net.httpserver.HttpHandler;
@@ -92,33 +94,40 @@ public class P2PNode {
         }
     }
 
+    // === UPLOAD HANDLER YANG TELAH DIPERBAIKI ===
     static class UploadHandler implements HttpHandler {
         private P2PNode node;
         public UploadHandler(P2PNode node) { this.node = node; }
         @Override
         public void handle(HttpExchange t) throws IOException {
             if (!"POST".equals(t.getRequestMethod())) {
-                t.sendResponseHeaders(405, -1); // Method Not Allowed
+                t.sendResponseHeaders(405, -1);
                 return;
             }
-            
+
             String filename = null;
             try {
-                String contentType = t.getRequestHeaders().getFirst("Content-Type");
-                if (contentType != null && contentType.startsWith("multipart/form-data")) {
-                    // Parsing multipart/form-data
-                    String boundary = contentType.substring(contentType.indexOf("boundary=") + 9);
-                    InputStream is = t.getRequestBody();
-                    
-                    // Sangat disederhanakan, hanya untuk mendapatkan nama file
-                    // Implementasi nyata akan memerlukan library parsing multipart yang lebih kuat
-                    Scanner scanner = new Scanner(is, "UTF-8").useDelimiter("--" + boundary);
-                    while (scanner.hasNext()) {
-                        String part = scanner.next();
-                        if (part.contains("filename=\"")) {
-                            filename = part.substring(part.indexOf("filename=\"") + 10, part.lastIndexOf("\""));
-                            break;
-                        }
+                // Membaca seluruh body request. Ini tidak efisien untuk file besar
+                // tapi lebih sederhana dan andal untuk skala proyek ini.
+                InputStream is = t.getRequestBody();
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                byte[] buffer = new byte[2048];
+                int length;
+                while ((length = is.read(buffer)) != -1) {
+                    baos.write(buffer, 0, length);
+                }
+                byte[] requestBodyBytes = baos.toByteArray();
+
+                // Konversi ke string untuk mencari nama file. Gunakan charset yang aman.
+                String requestBody = new String(requestBodyBytes, StandardCharsets.ISO_8859_1);
+                
+                String searchString = "filename=\"";
+                int startIndex = requestBody.indexOf(searchString);
+                if (startIndex != -1) {
+                    startIndex += searchString.length();
+                    int endIndex = requestBody.indexOf("\"", startIndex);
+                    if (endIndex != -1) {
+                        filename = new String(requestBody.substring(startIndex, endIndex).getBytes(StandardCharsets.ISO_8859_1), StandardCharsets.UTF_8);
                     }
                 }
             } catch (Exception e) {
@@ -127,6 +136,8 @@ public class P2PNode {
 
             String response;
             if (filename != null && !filename.isEmpty()) {
+                // Membersihkan nama file untuk keamanan
+                filename = new File(filename).getName();
                 node.addLocalFile(filename);
                 node.wsServer.broadcastState();
                 response = "File '" + filename + "' berhasil diunggah.";
@@ -136,7 +147,7 @@ public class P2PNode {
                 t.sendResponseHeaders(400, response.length());
             }
             OutputStream os = t.getResponseBody();
-            os.write(response.getBytes());
+            os.write(response.getBytes(StandardCharsets.UTF_8));
             os.close();
         }
     }
