@@ -51,6 +51,25 @@ class FileMetadata {
     }
 }
 
+// Kelas untuk menyimpan informasi lengkap tentang peer lain
+class PeerInfo {
+    String p2pAddress;
+    String httpAddress;
+
+    public PeerInfo(String p2pAddress, String httpAddress) {
+        this.p2pAddress = p2pAddress;
+        this.httpAddress = httpAddress;
+    }
+
+    public JSONObject toJSON() {
+        JSONObject json = new JSONObject();
+        json.put("p2pAddress", p2pAddress);
+        json.put("httpAddress", httpAddress);
+        return json;
+    }
+}
+
+
 public class P2PNode {
     private String peerId;
     private String userName;
@@ -62,7 +81,7 @@ public class P2PNode {
 
     private final Map<String, FileMetadata> fileStorage = new ConcurrentHashMap<>();
     private final Map<String, String> networkPublicFiles = new ConcurrentHashMap<>(); // filename -> ownerId
-    private final Map<String, String> discoveredPeers = new ConcurrentHashMap<>();
+    private final Map<String, PeerInfo> discoveredPeers = new ConcurrentHashMap<>();
     private final MyWebSocketServer wsServer;
 
     public P2PNode(int port) {
@@ -112,7 +131,6 @@ public class P2PNode {
         }
     }
 
-    // Handlers (Root, Login, App, Upload, Download) tetap sama seperti sebelumnya
     static class RootHandler implements HttpHandler {
         @Override
         public void handle(HttpExchange t) throws IOException {
@@ -236,7 +254,6 @@ public class P2PNode {
         }
     }
     
-    // Helper methods
     private static void sendHtmlResponse(HttpExchange t, String html) throws IOException {
         t.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
         byte[] responseBytes = html.getBytes(StandardCharsets.UTF_8);
@@ -261,8 +278,6 @@ public class P2PNode {
         return params;
     }
 
-    // === Logika Inti yang Diperbarui ===
-
     public void addFile(String filename, byte[] content, boolean isPublic) {
         FileMetadata metadata = new FileMetadata(filename, content, isPublic);
         fileStorage.put(filename, metadata);
@@ -277,7 +292,7 @@ public class P2PNode {
             if (metadata.isPublic) {
                 broadcastPublicFile(filename);
             } else {
-                // Opsional: bisa mengirim pesan "un-announce"
+                broadcastRemovePublicFile(filename);
             }
             wsServer.broadcastState();
         }
@@ -285,6 +300,11 @@ public class P2PNode {
 
     private void broadcastPublicFile(String filename) {
         String message = String.format("PUBLIC_FILE_ANNOUNCE::%s::%s", this.peerId, filename);
+        broadcastToPeers(message);
+    }
+
+    private void broadcastRemovePublicFile(String filename) {
+        String message = String.format("PUBLIC_FILE_REMOVE::%s::%s", this.peerId, filename);
         broadcastToPeers(message);
     }
     
@@ -316,7 +336,7 @@ public class P2PNode {
 
     private void broadcastToPeers(String message) {
         wsServer.logToUI("Melakukan broadcast: " + message.split("::")[0]);
-        discoveredPeers.forEach((id, address) -> {
+        discoveredPeers.forEach((id, peerInfo) -> {
             if (!id.equals(this.peerId)) {
                 sendMessageToPeer(id, message);
             }
@@ -324,9 +344,9 @@ public class P2PNode {
     }
 
     private void sendMessageToPeer(String peerId, String message) {
-        String address = discoveredPeers.get(peerId);
-        if (address != null) {
-            String[] parts = address.split(":");
+        PeerInfo peerInfo = discoveredPeers.get(peerId);
+        if (peerInfo != null) {
+            String[] parts = peerInfo.p2pAddress.split(":");
             String host = parts[0];
             int port = Integer.parseInt(parts[1]);
             new Thread(() -> {
@@ -351,15 +371,18 @@ public class P2PNode {
     
     public String getPeerId() { return peerId; }
     public String getHostIp() { return hostIp; }
+    public int getHttpPort() { return httpPort; }
     public int getP2pPort() { return p2pPort; }
-    public Map<String, String> getDiscoveredPeers() { return discoveredPeers; }
+    public Map<String, PeerInfo> getDiscoveredPeers() { return discoveredPeers; }
     public Map<String, FileMetadata> getFileStorage() { return fileStorage; }
     public Map<String, String> getNetworkPublicFiles() { return networkPublicFiles; }
-    public byte[] getFileContent(String filename) { return fileStorage.get(filename).content; }
+    public byte[] getFileContent(String filename) { 
+        FileMetadata meta = fileStorage.get(filename);
+        return meta != null ? meta.content : null;
+    }
     public MyWebSocketServer getWsServer() { return wsServer; }
     public boolean hasFile(String filename) { return fileStorage.containsKey(filename); }
 
-    // Helper methods
     private static String getMimeType(String filename) {
         try {
             return Files.probeContentType(Paths.get(filename));
@@ -520,10 +543,13 @@ public class P2PNode {
              + "  });"
              + "  publicFilesTableBody.innerHTML = '';"
              + "  Object.entries(data.networkPublicFiles).forEach(([filename, ownerId]) => {"
+             + "    const ownerInfo = data.discoveredPeers[ownerId];"
+             + "    if (!ownerInfo) return;"
+             + "    const downloadUrl = `http://${ownerInfo.httpAddress}/download?file=${encodeURIComponent(filename)}`;"
              + "    const row = `<tr>"
              + "      <td class='px-4 py-2'>${filename}</td>"
              + "      <td class='px-4 py-2'>${ownerId}</td>"
-             + "      <td class='px-4 py-2'><button onclick='requestPermission(\"${ownerId}\", \"${filename}\")' class='text-blue-600 hover:underline'>Minta Izin</button></td>"
+             + "      <td class='px-4 py-2'><a href='${downloadUrl}' class='text-blue-600 hover:underline' download>Unduh Langsung</a></td>"
              + "    </tr>`;"
              + "    publicFilesTableBody.innerHTML += row;"
              + "  });"
@@ -610,6 +636,7 @@ class P2PListener extends Thread {
                     node.getWsServer().foundFile(senderId, payload);
                     break;
                 case "PERMISSION_REQUEST":
+                    // Permintaan izin hanya untuk file privat
                     node.getWsServer().permissionRequested(senderId, payload);
                     break;
                 case "PERMISSION_GRANTED":
@@ -628,6 +655,11 @@ class P2PListener extends Thread {
                     node.getWsServer().logToUI("File publik baru diumumkan: '" + payload + "' dari " + senderId);
                     node.getWsServer().broadcastState();
                     break;
+                case "PUBLIC_FILE_REMOVE":
+                    node.getNetworkPublicFiles().remove(payload);
+                    node.getWsServer().logToUI("File publik dihapus dari jaringan: '" + payload + "'");
+                    node.getWsServer().broadcastState();
+                    break;
             }
         } catch (IOException e) {
             // e.printStackTrace();
@@ -636,9 +668,9 @@ class P2PListener extends Thread {
         }
     }
      private void sendMessageToPeer(String peerId, String message) {
-        String address = node.getDiscoveredPeers().get(peerId);
-        if (address != null) {
-            String[] parts = address.split(":");
+        PeerInfo peerInfo = node.getDiscoveredPeers().get(peerId);
+        if (peerInfo != null) {
+            String[] parts = peerInfo.p2pAddress.split(":");
             String host = parts[0];
             int port = Integer.parseInt(parts[1]);
             try (Socket socket = new Socket(host, port);
@@ -675,7 +707,10 @@ class DiscoveryThread extends Thread {
                             Thread.sleep(1000);
                             continue;
                         }
-                        String message = String.format("DISCOVERY::%s::%s:%d", node.getPeerId(), node.getHostIp(), node.getP2pPort());
+                        // Format pesan baru: DISCOVERY::peerId::p2pAddress::httpAddress
+                        String p2pAddress = String.format("%s:%d", node.getHostIp(), node.getP2pPort());
+                        String httpAddress = String.format("%s:%d", node.getHostIp(), node.getHttpPort());
+                        String message = String.format("DISCOVERY::%s::%s::%s", node.getPeerId(), p2pAddress, httpAddress);
                         byte[] buf = message.getBytes();
                         DatagramPacket packet = new DatagramPacket(buf, buf.length, group, MULTICAST_PORT);
                         socket.send(packet);
@@ -685,16 +720,18 @@ class DiscoveryThread extends Thread {
             }).start();
 
             while (true) {
-                byte[] buf = new byte[256];
+                byte[] buf = new byte[512];
                 DatagramPacket packet = new DatagramPacket(buf, buf.length);
                 socket.receive(packet);
                 String received = new String(packet.getData(), 0, packet.getLength());
                 String[] parts = received.split("::");
-                if ("DISCOVERY".equals(parts[0])) {
+                if ("DISCOVERY".equals(parts[0]) && parts.length == 4) {
                     String peerId = parts[1];
-                    String address = parts[2];
-                    if (node.getPeerId() != null && !peerId.equals(node.getPeerId()) && node.getDiscoveredPeers().put(peerId, address) == null) {
-                        System.out.println("Peer baru ditemukan: " + peerId + " di " + address);
+                    String p2pAddress = parts[2];
+                    String httpAddress = parts[3];
+                    if (node.getPeerId() != null && !peerId.equals(node.getPeerId()) && node.getDiscoveredPeers().get(peerId) == null) {
+                        System.out.println("Peer baru ditemukan: " + peerId);
+                        node.getDiscoveredPeers().put(peerId, new PeerInfo(p2pAddress, httpAddress));
                         node.getWsServer().broadcastState();
                     }
                 }
@@ -772,7 +809,7 @@ class MyWebSocketServer extends WebSocketServer {
         state.put("networkPublicFiles", new JSONObject(node.getNetworkPublicFiles()));
         
         JSONObject peers = new JSONObject();
-        node.getDiscoveredPeers().forEach(peers::put);
+        node.getDiscoveredPeers().forEach((id, info) -> peers.put(id, info.toJSON()));
         state.put("discoveredPeers", peers);
         
         broadcast(state.toString());
